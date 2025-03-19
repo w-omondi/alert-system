@@ -1,0 +1,6 @@
+opencv-python
+numpy
+dlib
+pygame
+python-dotenv
+requests

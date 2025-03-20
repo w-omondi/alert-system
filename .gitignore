@@ -59,7 +59,6 @@ ehthumbs.db
 Thumbs.db
 
 # Project specific
-alert.mp3
 *.mp3
 *.wav
 *.ogg

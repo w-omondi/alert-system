@@ -1,6 +1,7 @@
 opencv-python
 numpy
-dlib
+mediapipe
 pygame
 python-dotenv
 requests
+flask

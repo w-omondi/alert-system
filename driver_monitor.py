@@ -1,5 +1,5 @@
 import cv2
-import dlib
+import mediapipe as mp
 import numpy as np
 import pygame
 import time
@@ -7,20 +7,54 @@ import requests
 from datetime import datetime
 import os
 from dotenv import load_dotenv
+from shared import alert_queue
 
 # Load environment variables
 load_dotenv()
 
 class DriverMonitor:
     def __init__(self):
-        # Initialize face detector and facial landmarks predictor
-        self.detector = dlib.get_frontal_face_detector()
-        self.predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
+        # Initialize MediaPipe Face Mesh
+        self.mp_face_mesh = mp.solutions.face_mesh
+        self.face_mesh = self.mp_face_mesh.FaceMesh(
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
         
-        # Initialize camera
-        self.cap = cv2.VideoCapture(0)
-        if not self.cap.isOpened():
-            raise RuntimeError("Could not open camera. Please check if your camera is connected and accessible.")
+        # Initialize camera with better error handling
+        self.cap = None
+        for i in range(2):  # Try first two camera indices
+            self.cap = cv2.VideoCapture(i)
+            if self.cap.isOpened():
+                # Test if we can actually read a frame
+                ret, frame = self.cap.read()
+                if ret:
+                    print(f"Successfully initialized camera {i}")
+                    break
+                else:
+                    print(f"Camera {i} opened but couldn't read frame")
+                    self.cap.release()
+                    self.cap = None
+            else:
+                print(f"Could not open camera {i}")
+        
+        if not self.cap or not self.cap.isOpened():
+            raise RuntimeError("""
+                Could not initialize camera. Please check:
+                1. Is your camera connected?
+                2. Do you have permission to access the camera?
+                3. Is another application using the camera?
+                4. Try running with sudo or adding your user to the video group:
+                   sudo usermod -a -G video $USER
+                   (Then log out and back in)
+            """)
+        
+        # Set camera properties for better performance
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.cap.set(cv2.CAP_PROP_FPS, 30)
         
         # Initialize pygame mixer
         try:
@@ -36,10 +70,10 @@ class DriverMonitor:
         self.frame_counter = 0
         
         # Constants for accident detection
-        self.motion_threshold = 10000  # Increased threshold
+        self.motion_threshold = 10000
         self.prev_frame = None
         self.accident_detected = False
-        self.warmup_frames = 30  # Number of frames to wait before starting detection
+        self.warmup_frames = 30
         self.frame_count = 0
         
         # Alert settings
@@ -54,27 +88,34 @@ class DriverMonitor:
             self.alert_sound = None
     
     def calculate_ear(self, eye_points):
-        """Calculate the Eye Aspect Ratio (EAR)"""
-        # Compute the vertical distances
-        v1 = np.linalg.norm(eye_points[1] - eye_points[5])
-        v2 = np.linalg.norm(eye_points[2] - eye_points[4])
+        """Calculate the Eye Aspect Ratio (EAR) using MediaPipe landmarks"""
+        # Get the eye landmarks (6 points for each eye)
+        p1, p2, p3, p4, p5, p6 = eye_points[:6]
         
-        # Compute the horizontal distance
-        h = np.linalg.norm(eye_points[0] - eye_points[3])
+        # Calculate vertical distances
+        v1 = np.linalg.norm(p2 - p6)
+        v2 = np.linalg.norm(p3 - p5)
+        
+        # Calculate horizontal distance
+        h = np.linalg.norm(p1 - p4)
         
         # Calculate EAR
         ear = (v1 + v2) / (2.0 * h)
         return ear
     
-    def detect_drowsiness(self, frame, face):
-        """Detect if the driver is drowsy"""
-        # Get facial landmarks
-        shape = self.predictor(frame, face)
-        shape = np.array([[p.x, p.y] for p in shape.parts()])
+    def detect_drowsiness(self, frame, face_landmarks):
+        """Detect if the driver is drowsy using MediaPipe landmarks"""
+        if not face_landmarks:
+            return False
+            
+        # Get eye landmarks (MediaPipe indices for 6 points per eye)
+        left_eye = np.array([face_landmarks.landmark[i] for i in [33, 246, 161, 160, 159, 158]])
+        right_eye = np.array([face_landmarks.landmark[i] for i in [362, 398, 384, 385, 386, 387]])
         
-        # Get eye landmarks
-        left_eye = shape[36:42]
-        right_eye = shape[42:48]
+        # Convert to numpy arrays and scale to frame size
+        h, w = frame.shape[:2]
+        left_eye = np.array([[int(p.x * w), int(p.y * h)] for p in left_eye])
+        right_eye = np.array([[int(p.x * w), int(p.y * h)] for p in right_eye])
         
         # Calculate EAR for both eyes
         left_ear = self.calculate_ear(left_eye)
@@ -140,15 +181,16 @@ class DriverMonitor:
             except:
                 print("Could not play sound alert")
         
-        # Send HTTP alert (you can configure this to your preferred endpoint)
+        # Add alert to queue
         alert_data = {
             "type": alert_type,
             "message": message,
             "timestamp": datetime.now().isoformat()
         }
+        alert_queue.put(alert_data)
         
+        # Send HTTP alert
         try:
-            # Replace with your actual alert endpoint
             alert_url = os.getenv('ALERT_ENDPOINT', 'http://localhost:8000/alert')
             response = requests.post(alert_url, json=alert_data)
             print(f"Alert sent: {response.status_code}")
@@ -167,19 +209,28 @@ class DriverMonitor:
                 print("Failed to grab frame")
                 break
             
-            # Detect faces
-            faces = self.detector(frame)
+            # Convert BGR to RGB
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
-            for face in faces:
-                # Draw face rectangle
-                x1, y1, x2, y2 = face.left(), face.top(), face.right(), face.bottom()
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                
-                # Check for drowsiness
-                if self.detect_drowsiness(frame, face):
-                    self.send_alert("drowsiness", "Driver appears to be drowsy!")
-                    cv2.putText(frame, "DROWSINESS ALERT!", (10, 30),
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            # Process the frame with MediaPipe
+            results = self.face_mesh.process(rgb_frame)
+            
+            if results.multi_face_landmarks:
+                for face_landmarks in results.multi_face_landmarks:
+                    # Draw face mesh using the correct method
+                    mp.solutions.drawing_utils.draw_landmarks(
+                        image=frame,
+                        landmark_list=face_landmarks,
+                        connections=mp.solutions.face_mesh.FACEMESH_TESSELATION,
+                        landmark_drawing_spec=None,
+                        connection_drawing_spec=mp.solutions.drawing_styles.get_default_face_mesh_tesselation_style()
+                    )
+                    
+                    # Check for drowsiness
+                    if self.detect_drowsiness(frame, face_landmarks):
+                        self.send_alert("drowsiness", "Driver appears to be drowsy!")
+                        cv2.putText(frame, "DROWSINESS ALERT!", (10, 30),
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             
             # Check for accidents
             if self.detect_accident(frame):
